@@ -1,3 +1,8 @@
 *.sh text eol=lf
 *.py text eol=lf
 *.ps1 text eol=crlf
+
+# The built output is committed and must stay byte-identical to what tsc
+# writes (LF). Without this, a Windows checkout (core.autocrlf=true) shows
+# every lib file as modified after every build even though nothing changed.
+lib/** text eol=lf
