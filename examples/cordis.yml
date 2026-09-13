@@ -1,10 +1,14 @@
-# 示例：把 dsh-api-gateway（loopback proxy 形态）加进你的宿主组合（host composition）。
+# 示例：把 dsh-api-gateway 加进你的宿主组合（host composition）。
 #
 # 你的部署已有完整的宿主组合文件（cordis.yml）——不要整体替换，只需把
 # `dsh-api-gw` 这一行加进去（行格式与现有行保持一致），然后重启。
+# profile 配置了 `patchReload: live` 时，也可以写进 profile 的 cordis.patch.yml
+# 的 insert 列表里热加载。
 #
 # 平面归属：该插件发布跨会话共享的 HTTP 服务，必须挂在宿主组合，
 # 不能放进任何 agent preset。
+#
+# 版本要求：DSH 0.1.5-rc.2（0.1.1-rc.2 的旧 wire 协议不受支持）。
 
 # 部署自带的 HTTP 载体行（示例，按你现有配置为准）：
 - id: webserver
@@ -13,7 +17,7 @@
     host: 127.0.0.1
     port: 3080
 
-# ……你的部署其余宿主行（agent-loop、sessions、sandbox、llm 路由等）……
+# ……你的部署其余宿主行（api-gateway、client-connection、api-remotes 等）……
 
 # API Gateway 行 —— 把它复制进你的组合：
 - id: dsh-api-gw
@@ -26,7 +30,7 @@
     adminKey: change-me         # 可选：设置后启用 admin 端点
     corsOrigin: '*'             # 可选：CORS 源（公开部署建议收敛）
     exposeErrors: true          # 可选：错误响应是否带内部细节（公开部署建议 false）
-    proxyTarget: http://127.0.0.1:3080/api   # 上游 /api 基础地址（一般不动）
-    # proxyWhitelist: [...]     # 可选：覆盖默认白名单（默认见 README）
+    # proxyWhitelist: [...]     # 可选：覆盖 unary 端点白名单（默认见 README）
+    # muxWhitelist: [...]       # 可选：覆盖流端点白名单（默认见 README）
 
-# 卸载 = 删除上面这一行（可选 dsh plugin remove dsh-api-gateway），重启。
+# 卸载 = 删除上面这一行（可选 `dsh plugin remove dsh-api-gateway`），重启。

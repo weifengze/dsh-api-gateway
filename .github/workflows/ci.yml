@@ -21,12 +21,9 @@ jobs:
       # Unit tests run against the built output in lib/, so they also guard the
       # shape the deployment actually loads.
       - run: pnpm test
-      # Syntax sanity for the client bundle (it ships as .tsx source and is
-      # bundled by the consuming deployment, but must at least parse).
-      - run: node --experimental-strip-types --check src/index.ts
-      - name: Smoke (optional — only when a gateway is reachable)
+      - name: Live acceptance (optional — only when a gateway is reachable)
         if: ${{ vars.DSH_AGW_BASE != '' }}
         env:
           DSH_AGW_BASE: ${{ vars.DSH_AGW_BASE }}
           DSH_AGW_KEY: ${{ secrets.DSH_AGW_KEY }}
-        run: pnpm smoke
+        run: pnpm acceptance

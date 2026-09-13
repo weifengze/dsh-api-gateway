@@ -1,111 +1,203 @@
 # dsh-api-gateway
 
-DeepSeek Harness 宿主插件：一个**带鉴权、fail-closed 的 loopback 反向代理**，把宿主机自身的
-`/api` 面（apiproxy = `dsh-client-connection` + `dsh-host-apiproxy`）暴露给另一台机器上的客户端
-（典型：dsh-agent-manager）。
+DeepSeek Harness (DSH) host plugin: an **authenticated, fail-closed gateway**
+that exposes the harness's in-process Remote API to clients on other machines
+(typically `dsh-agent-manager`).
 
-> v0.2.0 起（S3）：插件不再自己驱动 agent。会话、消息、问答、授权全部由宿主的 apiproxy 处理，
-> 插件只做三件事：**鉴权、白名单、透传**。
+> v0.3.0 target: **DSH 0.1.5-rc.2**. The plugin runs inside the DSH process and
+> dispatches everything in-process; it only ever exposes **authentication,
+> whitelists, and transport** to the outside.
 
-## 为什么需要它
+## Why it exists
 
-DSH 的 `/api` 只认 loopback（Host 头栅栏不是鉴权，跨机直连 `:3080` 不可行也不安全）。
-本插件跑在 DSH 进程内，内部 fetch 天然走 loopback，对外靠 API Key 鉴权 + 白名单保护。
+DSH 0.1.5's `/api` route is fenced twice: a Host/Origin check **and** a
+browser-session cookie (`browserAuth`). A plain loopback HTTP fetch therefore
+cannot reach `/api` — not even from the host's own process. DSH exposes
+supported in-process seams instead:
 
-## 安装
+- `ctx.connection.createSharedFetchHandler('/api')` — the Fetch handler behind
+  the `/api` route **without** its auth fence;
+- `ctx.typertGateway.wireStream.open(endpoint, payload, signal)` — any Remote
+  stream, including the Gateway-owned `$events` stream that carries forwarded
+  approvals and user questions.
+
+This plugin wraps those seams in an API-key-authenticated HTTP/WebSocket
+surface for remote clients.
+
+## Requirements
+
+- DSH **0.1.5-rc.2** (`^0.1.5-rc.2` peer dependencies).
+- The host composition must provide `webServer`, `connection`, and
+  `typertGateway` (the `dsh-web-app` bundle does).
+- The gateway publishes a cross-session HTTP surface, so it belongs in the
+  **host composition** — never inside an agent preset.
+
+> The 0.1.1-rc.2 wire protocol (dot endpoints like `session.list`, the
+> `events.mux` downlink pipe, `respond`) is **not** supported by 0.3.x.
+
+## Install
 
 ```powershell
 dsh plugin --profile web add github:litestartup-com/dsh-api-gateway
 ```
 
-在宿主组合加一行（见 `examples/cordis.yml`），重启 DSH。
+Add one row to the host composition (see `examples/cordis.yml`) and restart.
+Profiles with `patchReload: live` hot-apply the row without a restart.
 
-## 配置
+## Configuration
 
-| 字段 | 默认 | 说明 |
+| Field | Default | Description |
 | --- | --- | --- |
-| `prefix` | `/api-gw/v1` | 路由前缀 |
-| `enabled` | `true` | 主开关（可 admin 运行时切换） |
-| `apiKeys` | `[]` | 静态 API 密钥 |
-| `provisionedKey` | — | `POST {prefix}/key` 一次性自助发放的密钥（存 settings） |
-| `allowKeyProvision` | `true` | 允许首次无钥自助发放 |
-| `adminKey` | — | 设置后启用 admin 端点 |
-| `corsOrigin` | `*` | CORS 来源（`'*'` 或具体域/数组） |
-| `exposeErrors` | `true` | 错误响应是否带内部细节 |
-| `proxyTarget` | `http://127.0.0.1:3080/api` | 上游 `/api` 基础地址 |
-| `proxyWhitelist` | 默认白名单 | 可选：覆盖默认白名单 |
+| `prefix` | `/api-gw/v1` | Route prefix |
+| `enabled` | `true` | Master switch (runtime-toggleable through admin) |
+| `apiKeys` | `[]` | Static API keys |
+| `provisionedKey` | — | Key minted by `POST {prefix}/key`, persisted via settings |
+| `allowKeyProvision` | `true` | Allow the first unauthenticated self-service mint |
+| `adminKey` | — | Enables the admin endpoints when set |
+| `corsOrigin` | `*` | CORS origin (`'*'`, one origin, or a list) |
+| `exposeErrors` | `true` | Include internal error details in responses |
+| `proxyWhitelist` | see below | Unary endpoint whitelist override |
+| `muxWhitelist` | see below | Stream endpoint whitelist override |
 
-## 端点
+## Endpoints
 
-| 方法 | 路径 | 鉴权 |
+| Method | Path | Auth |
 | --- | --- | --- |
-| GET | `{prefix}/health` | 无 |
-| POST | `{prefix}/key` | 首次无钥（一次性自助发放） |
-| POST | `{prefix}/admin/enable` | X-Admin-Key |
-| POST | `{prefix}/admin/rotate-key` | X-Admin-Key |
-| POST | `{prefix}/proxy/<method>` | X-API-Key / Bearer |
-| POST | `{prefix}/proxy/respond` | X-API-Key / Bearer |
-| POST | `{prefix}/sessions/{id}/sandbox-mode` | X-API-Key / Bearer |
-| GET | `{prefix}/events.mux`（WebSocket 升级） | X-API-Key |
+| GET | `{prefix}/health` | none |
+| POST | `{prefix}/key` | first call only (self-service mint) |
+| POST | `{prefix}/admin/enable` | `X-Admin-Key` |
+| POST | `{prefix}/admin/rotate-key` | `X-Admin-Key` |
+| POST | `{prefix}/proxy/<namespace>/<method>` | `X-API-Key` / Bearer |
+| POST | `{prefix}/sessions/{id}/sandbox-mode` | `X-API-Key` / Bearer |
+| GET | `{prefix}/events.mux` (WebSocket) | `X-API-Key` / Bearer |
+| GET | `{prefix}/proxy/events.mux` | alias of `events.mux` |
 
-`sessions/{id}/sandbox-mode`：请求体 `{ "mode": "read-only" | "workspace-write" }`，给**活会话**写一个
-`sandbox/mode` 覆盖事件（`dsh-sandbox-policy/session-mode`，持久、冷醒 replay 恢复）。冷/失联会话 → 409
-`session_not_live`；`danger-full-access` 不可经 wire 授予（宿主 UI 专属）。这是 wire 上唯一能按会话设置
-沙箱模式的通道（`session.create` 无沙箱字段），供 manager 在创建会话后、首次 prompt 前调用一次。
+## Wire contract
 
-同一 mux 升级路径也注册在 `{prefix}/proxy/events.mux`，使客户端「base + method」的统一约定
-（manager 的 rpc base 即 `/api-gw/v1/proxy`）无需为 mux 特判。
+The gateway does not parse RPC bodies; it forwards bytes to the host, which
+validates `args` against its generated descriptors.
 
-mux 管道**下行只读**：客户端发任何帧都被 1008 关闭（与宿主 mux 行为一致）。断线重连是客户端的事。
+**Unary** — request and response keep the host envelope:
 
-## 白名单（默认）
+```jsonc
+// POST {prefix}/proxy/session/create
+{ "type": "client-request", "rpcId": "c1", "method": "session/create",
+  "payload": { "args": { "request": { "cwd": "E:/work/demo" } } } }
 
-```
-session.list, session.create, session.history,
-session.prompt, session.cancel, session.rename,
-session.fork, session.updateQueue, session.attachment,
-session.models, session.selectModel,
-respond,  host.describe
+// -> { "type": "server-response", "rpcId": "c1",
+//      "result": { "ok": true, "value": { "sessionId": "session-..." } } }
 ```
 
-白名单外 → `403 { error: 'method_not_allowed' }`，**不发往上游**。特权面
-（`credentials.*`、`settings.*`、`host.openPath`、`host.pickDirectory`、`llm.discoverModels` 等）
-在代理上不可达。注意：真实方法名是 `host.describe`（`host.version` 不存在）。
+Argument names come from the host descriptor: `session/create` takes
+`request`, `session/list` takes `_request`, `session/modelCatalog` takes no
+arguments (`{ "args": {} }`).
 
-## 安全模型
+**Mux** — one WebSocket multiplexes logical streams:
 
-- 鉴权不可退化：constant-time 比较、CSPRNG 密钥、一次性自助发放（已有任何密钥即永久关闭）。
-- 白名单 fail-closed；代理**不解析 RPC 包络**，只按路径段校验方法名，字节透传。
-- 密钥绝不写日志；`apiKeys`/`adminKey` 在 settings 线上 surface 脱敏。
+```jsonc
+// client -> host
+{ "type": "open", "streamId": "s1", "endpoint": "session/follow", "payload": { "args": { "request": { "address": { "kind": "session", "sessionId": "session-..." } } } } }
+{ "type": "cancel", "streamId": "s1" }
 
-## 部署步骤
+// host -> client
+{ "type": "item",  "streamId": "s1", "value": ... }
+{ "type": "error", "streamId": "s1", "error": { "code": "...", "message": "...", "details": {} } }
+{ "type": "end",   "streamId": "s1" }
+```
 
-1. 构建并提交：`pnpm build && pnpm test`（42 测试全绿；`lib/` 必须同步提交）。
-2. 更新宿主安装：`dsh plugin update`（或 `profiles/web` 下 `pnpm install`）。
-3. 重启 DSH。
-4. 跑验收（见下）。
+The server pings every 2s and terminates a socket after 2 missed pongs.
 
-## 验收步骤
+**Approvals and questions** arrive on the `$events` stream (open it with
+payload `{ "args": {} }`); the first frame is
+`{ "type": "ready", "clientId": "...", "host": { "home": "..." } }`, followed by
+`emit` / `waterfall` / `cancel` frames. Answer a `waterfall` frame through the
+unary proxy:
 
-1. `GET {prefix}/health` → 200，`upstream: ok`。
-2. `POST {prefix}/proxy/credentials.set`（带正确 key）→ 403 `method_not_allowed`。
-3. `POST {prefix}/proxy/session.list` 用错 key → 401。
-4. 带正确 key：`POST {prefix}/proxy/host.describe` 返回 DSH 版本；`session.list` 返回会话列表。
-5. WebSocket 连 `ws://host{prefix}/proxy/events.mux`（握手带 `X-API-Key`），
-   `session.prompt` 后应实时收到 `session/event` 帧直到 `turn/end`。
+```jsonc
+// POST {prefix}/proxy/$events/result
+{ "type": "client-request", "rpcId": "a1", "method": "$events/result",
+  "payload": { "args": { "clientId": "...", "eventId": "...", "outcome": { "kind": "result", "value": ... } } } }
+```
 
-自动化验收：本仓库 `scripts/proxy-host.mjs`（独立验收宿主）+
-`dsh-agent-manager/scripts/smoke-proxy-b.ts`（manager 走 proxy 路径的端到端冒烟）。
+`outcome.kind` is `result` (answer), `next` (delegate to the next answerer), or
+`rejected`. An unanswered approval fails closed as `unavailable`.
 
-## 卸载
+## Whitelists (defaults)
 
-删除组合里的插件行（可选 `dsh plugin remove dsh-api-gateway`），重启。
+Unary (`proxyWhitelist`):
 
-## 文档范围
+```
+session/list, session/create, session/page,
+session/prompt, session/cancel, session/rename,
+session/fork, session/updateQueue, session/attachment,
+session/modelCatalog, session/selectModel,
+$events/result
+```
 
-本仓库只保留使用者需要的内容：本 README、`README.zh.md`、`openapi.yaml`、示例与测试。
-**内部设计与重构计划不在本仓库**（集中在不公开发布的内部设计库）——代码、接口契约与
-示例即完整的可运行、可自托管交付物。
+Streams (`muxWhitelist`):
+
+```
+$events, session/follow, session/control
+```
+
+Anything else is refused before the host is touched: unary endpoints answer
+`403 method_not_allowed`, stream endpoints produce an `error` frame
+(`gateway/endpoint-not-allowed`). The privileged plane — `credentials/*`,
+`settings/*`, `workspace/*`, `agentPresets/*`, `goals/*`, `subagents/*`,
+`llm/discoverModels`, `session/search` — stays unreachable by default.
+
+`sessions/{id}/sandbox-mode`: body `{ "mode": "read-only" | "workspace-write" }`
+pins a `sandbox/mode` override on a **live** session (durable across cold wake).
+Cold or unknown sessions answer `409 session_not_live`; `danger-full-access`
+cannot be granted over the wire.
+
+## Security model
+
+- Authentication cannot degrade: constant-time comparison, CSPRNG keys, a
+  one-time self-service bootstrap that closes permanently after the first mint
+  (including while the key is memory-only), and rotation that really revokes.
+- Whitelists are fail-closed and checked **after** authentication, so an
+  unauthenticated caller cannot probe which endpoints exist.
+- The gateway never parses or rewrites the RPC envelope; the host remains the
+  single owner of the wire contract and its error shapes.
+- Keys are never logged; `apiKeys` / `adminKey` / `provisionedKey` carry
+  `role('secret')` so the settings surface redacts them.
+
+## Deployment
+
+1. Build and test: `pnpm build && pnpm test` (`lib/` is committed and must stay
+   in sync — the deployment loads it).
+2. Install/update the host copy: `dsh plugin update` (or `pnpm install` in the
+   profile).
+3. Restart DSH (or rely on `patchReload: live` for a patch-row mount).
+4. Run the acceptance below.
+
+## Acceptance
+
+With the gateway mounted (see `scripts/acceptance.mjs` for the header docs):
+
+```powershell
+$env:DSH_AGW_KEY = 'acceptance-key'
+node scripts/acceptance.mjs            # read-only checks
+$env:DSH_AGW_MUTATE = '1'              # optional: creates a real session,
+node scripts/acceptance.mjs            # pins its sandbox mode, renames it
+```
+
+Environment: `DSH_AGW_BASE` (default `http://127.0.0.1:3080`),
+`DSH_AGW_PREFIX` (default `/api-gw/v1`), `DSH_AGW_KEY` (required),
+`DSH_AGW_MUTATE` / `DSH_AGW_CWD` (optional write-path checks).
+
+## Uninstall
+
+Remove the plugin row from the composition (optionally
+`dsh plugin remove dsh-api-gateway`) and restart.
+
+## Documentation scope
+
+This repository keeps only what a user needs: README, `openapi.yaml`, examples,
+and tests. Internal design and refactor plans live elsewhere; the code, the
+interface contract, and the examples are the complete runnable, self-hostable
+delivery.
 
 ## License
 

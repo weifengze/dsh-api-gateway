@@ -44,19 +44,6 @@ export const routeSegments = (prefix: string, url: string | undefined): string[]
 }
 
 /**
- * Decode a request body honouring the Content-Type charset (RFC 9110):
- * default UTF-8, but accept e.g. gbk/gb2312 from clients that still send
- * ANSI-encoded bodies (notably Windows PowerShell 5.1).
- */
-export const decodeBody = (buf: Uint8Array, contentType: string | undefined): string => {
-  const charset = /charset=([^;]+)/i.exec(String(contentType ?? ''))?.[1]?.trim()
-  if (charset !== undefined && charset !== '' && !/^utf-?8$/i.test(charset)) {
-    try { return new TextDecoder(charset).decode(buf) } catch { /* fall through to utf8 */ }
-  }
-  return Buffer.from(buf).toString('utf8')
-}
-
-/**
  * Whether `POST {prefix}/key` may still mint a key.
  *
  * The bootstrap is meant to be available only while the deployment has no key at
@@ -77,15 +64,17 @@ export const provisionDecision = (input: {
   apiKeys: readonly string[]
   allowKeyProvision: boolean
   prefix: string
+  /** True while a minted-but-unpersisted key is live (no settings provider). */
+  volatileKey?: boolean
 }): ProvisionDecision => {
   const configured = input.apiKeys.filter((k) => k !== '')
   const provisioned = input.provisionedKey !== undefined && input.provisionedKey !== ''
-  if (provisioned || configured.length > 0) {
+  if (provisioned || input.volatileKey === true || configured.length > 0) {
     return {
       action: 'refuse',
       status: 403,
       error: 'key_already_provisioned',
-      hint: provisioned
+      hint: provisioned || input.volatileKey === true
         ? `A key was already provisioned. Rotate it with POST ${input.prefix}/admin/rotate-key (requires X-Admin-Key).`
         : 'Static apiKeys are configured; authenticate with one of them.',
     }
@@ -99,14 +88,4 @@ export const provisionDecision = (input: {
     }
   }
   return { action: 'mint' }
-}
-
-/** Project a persisted session header down to the wire shape. */
-export const mapHeader = (header: unknown): { id: string | null; title: string | null; cwd: string | null } => {
-  const h = header as { id?: unknown; title?: unknown; cwd?: unknown } | null | undefined
-  return {
-    id: typeof h?.id === 'string' ? h.id : null,
-    title: typeof h?.title === 'string' ? h.title : null,
-    cwd: typeof h?.cwd === 'string' ? h.cwd : null,
-  }
 }

@@ -1,18 +1,29 @@
 /**
- * dsh-api-gateway — Host half (S3: authenticated loopback proxy).
+ * dsh-api-gateway — Host half (0.3: in-process Remote gateway for DSH 0.1.5).
  *
- * The plugin no longer drives agents. It is a thin, fail-closed reverse proxy
- * that lets an external client (the manager) reach the harness's own /api
- * surface (dsh-client-connection + dsh-host-apiproxy) from another machine:
+ * The plugin publishes an authenticated, fail-closed HTTP/WebSocket surface to
+ * remote clients (typically dsh-agent-manager) and dispatches every request
+ * INSIDE the host process:
  *
- *   POST {prefix}/proxy/<method>  ->  POST <proxyTarget>/<method>   (unary passthrough)
- *   POST {prefix}/proxy/respond   ->  POST <proxyTarget>/respond    (answers)
- *   GET  {prefix}/events.mux      ->  WS <proxyTarget>/events.mux   (downlink-only pipe)
+ *   POST {prefix}/proxy/<namespace>/<method>  -> host shared /api fetch handler
+ *   GET  {prefix}/events.mux                  -> WS mux: open/cancel streams,
+ *                                                item/error/end frames
+ *   POST {prefix}/sessions/{id}/sandbox-mode  -> in-process sandbox override
  *
- * Every proxied path requires an API key, and every method must be on the
- * whitelist — anything else is refused before touching the upstream. The
- * proxy never parses the RPC envelope: it forwards bytes, so the wire
- * contract belongs to DSH and the manager, not to this plugin.
+ * Why in-process dispatch: DSH 0.1.5 gates its `/api` route with Host/Origin
+ * checks AND a browser-session cookie (`browserAuth`), so a loopback HTTP fetch
+ * is not a viable upstream — even from the host's own process. The host
+ * connection service exposes `createSharedFetchHandler('/api')`, whose Fetch
+ * handler composes exact routes plus the Typert interceptor WITHOUT the HTTP
+ * route's auth fence; that is the supported in-process entry. Streams go
+ * through `ctx.typertGateway.wireStream.open(endpoint, payload, signal)`,
+ * including the Gateway-owned `$events` stream that carries forwarded
+ * approvals and user questions.
+ *
+ * Every proxied unary endpoint must be on the whitelist and every mux stream
+ * endpoint must be on the mux whitelist — anything else is refused before the
+ * host is touched. The proxy never parses the RPC envelope's contents: it
+ * forwards bytes and lets the host validate `args` against its descriptors.
  *
  * Install: pnpm add dsh-api-gateway, then add one row to the host composition
  * (see README / examples/cordis.yml). Uninstall: remove the row and restart.
@@ -25,13 +36,20 @@ import type { IncomingMessage, ServerResponse } from 'node:http'
 import type { WebRoute, WebUpgradeRoute } from '@deepseek-ai/dsh-host-webserver'
 import type { SessionId, SessionStore } from '@deepseek-ai/dsh-session'
 import { setSandboxMode } from '@deepseek-ai/dsh-sandbox-policy'
-import { settingsNamespace } from '@deepseek-ai/dsh-settings'
 import { randomBytes, timingSafeEqual } from 'node:crypto'
 import { createRequire } from 'node:module'
 import z from '@deepseek-ai/schemastery'
 import { WebSocket, WebSocketServer } from 'ws'
+import type { HostConnection, HostSettings, HostTypertGateway, SettingsNamespaceScope } from './dsh.js'
 import { provisionDecision, resolveCorsOrigin, routeSegments } from './http.js'
-import { DEFAULT_PROXY_WHITELIST, isProxyMethodAllowed, muxProxyUrl, unaryProxyUrl } from './proxy.js'
+import { MuxSession } from './mux.js'
+import {
+  DEFAULT_MUX_WHITELIST,
+  DEFAULT_PROXY_WHITELIST,
+  dispatchUrl,
+  endpointOf,
+  isProxyEndpointAllowed,
+} from './proxy.js'
 import { isRemoteSandboxMode, REMOTE_SANDBOX_MODES } from './sandbox-mode.js'
 
 /** Single source of truth for the version advertised by the service index. */
@@ -64,10 +82,10 @@ export interface Config {
   corsOrigin: string | string[]
   /** Include internal error messages in HTTP responses (helpful locally, noisy publicly). */
   exposeErrors: boolean
-  /** Upstream /api base to forward to. Defaults to the loopback DSH /api. */
-  proxyTarget: string
-  /** Optional override for the proxy whitelist; defaults to DEFAULT_PROXY_WHITELIST. */
+  /** Unary endpoint whitelist; defaults to DEFAULT_PROXY_WHITELIST. */
   proxyWhitelist: string[]
+  /** Mux stream endpoint whitelist; defaults to DEFAULT_MUX_WHITELIST. */
+  muxWhitelist: string[]
 }
 
 export const Config = z.object({
@@ -82,9 +100,12 @@ export const Config = z.object({
   adminKey: z.string().role('secret'),
   corsOrigin: z.union([z.string(), z.array(z.string())]).default('*'),
   exposeErrors: z.boolean().default(true),
-  proxyTarget: z.string().default('http://127.0.0.1:3080/api'),
   proxyWhitelist: z.array(z.string()).default([...DEFAULT_PROXY_WHITELIST]),
+  muxWhitelist: z.array(z.string()).default([...DEFAULT_MUX_WHITELIST]),
 })
+
+/** Settings namespace; must match the host's lowercase-hyphen namespace rule. */
+const SETTINGS_NAMESPACE = 'dsh-api-gw'
 
 export default {
   inject: ['webServer'],
@@ -95,12 +116,12 @@ export default {
     // Mutable runtime config: seeded from the composition row, then re-applied
     // live from the settings namespace (settings integration) below.
     let cfg = config
-    let settingsScope: { update: (patch: object) => Promise<void> } | null = null
+    let settingsScope: SettingsNamespaceScope<Config> | null = null
     /**
      * Fallback home for a minted key when there is no settings provider to
      * persist it in. A deployment without one cannot make the key durable, so it
-     * keeps the old in-memory behaviour and says so in the log; everywhere else
-     * cfg.provisionedKey is the real storage.
+     * keeps the old in-memory behaviour and says so in the log; while it is
+     * live, `provisionDecision` still refuses a second mint.
      */
     let volatileKey: string | null = null
 
@@ -133,6 +154,11 @@ export default {
       return cfg.exposeErrors ? message : 'internal error (set exposeErrors: true for details)'
     }
 
+    /** Host service lookup that never throws when the service is absent. */
+    const hostService = <T>(name: string): T | undefined => {
+      try { return ctx.get(name, true) as T | undefined } catch { return undefined }
+    }
+
     /**
      * Access-Control-Allow-Origin carries a single value, so an allow-list is
      * matched against the request Origin and echoed (with Vary: Origin); a
@@ -155,7 +181,7 @@ export default {
 
     /**
      * Buffered body read with a fixed cap and timeout, so a stalled client
-     * cannot pin the proxy. The body is NOT parsed: the proxy forwards bytes.
+     * cannot pin the gateway. The body is NOT parsed: the host validates it.
      */
     const BODY_TIMEOUT_MS = 30_000
     const readBodyRaw = (req: IncomingMessage): Promise<Buffer> => new Promise((resolve, reject) => {
@@ -235,72 +261,58 @@ export default {
       return false
     }
 
-    // ---- proxy ----
+    // ---- in-process dispatch ----
 
-    /** Generous: unary calls answer quickly, but a slow create must not 502. */
-    const PROXY_TIMEOUT_MS = 60_000
+    /** Generous: unary calls answer quickly, but a cold resume must not 504. */
+    const DISPATCH_TIMEOUT_MS = 60_000
 
     /**
-     * One unary passthrough: authenticated + whitelisted already by the caller.
-     * Reads the client body verbatim, forwards it, streams the upstream reply
-     * back untouched (status + content-type + body).
+     * Forward one already-authenticated, already-whitelisted unary call into
+     * the host's shared /api fetch handler. The response envelope (status,
+     * content-type, body) is returned to the client verbatim, so the host
+     * stays the single owner of the wire contract and its error shapes.
      */
-    const proxyUnary = async (req: IncomingMessage, res: ServerResponse, method: string) => {
+    const proxyUnary = async (req: IncomingMessage, res: ServerResponse, endpoint: string) => {
+      const connection = hostService<HostConnection>('connection')
+      if (connection === undefined) throw new Error('host connection service is unavailable')
       const body = await readBodyRaw(req)
-      const upstream = await fetch(unaryProxyUrl(cfg.proxyTarget, method), {
+      const handler = connection.createSharedFetchHandler('/api')
+      const response = await handler.fetch(new Request(dispatchUrl(endpoint), {
         method: 'POST',
         headers: { 'content-type': req.headers['content-type'] ?? 'application/json' },
-        // Uint8Array rather than Buffer: the DOM fetch typings accept the
-        // former as BodyInit, and undici takes both at runtime.
         ...(body.length === 0 ? {} : { body: new Uint8Array(body) }),
-        signal: AbortSignal.timeout(PROXY_TIMEOUT_MS),
-      })
-      const payload = Buffer.from(await upstream.arrayBuffer())
-      res.writeHead(upstream.status, {
-        'content-type': upstream.headers.get('content-type') ?? 'application/json; charset=utf-8',
+        signal: AbortSignal.timeout(DISPATCH_TIMEOUT_MS),
+      }))
+      const payload = Buffer.from(await response.arrayBuffer())
+      res.writeHead(response.status, {
+        'content-type': response.headers.get('content-type') ?? 'application/json; charset=utf-8',
       })
       res.end(payload)
     }
 
     /**
-     * The mux WebSocket pipe: one outer socket per client, one inner client to
-     * the harness mux. Downlink only, mirroring the harness: any client frame
-     * closes the socket with 1008, and only upstream frames flow outward.
-     * Reconnect belongs to the client (the manager), not to the proxy.
+     * Upstream liveness for /health: one cheap, bounded session/list probe
+     * through the same in-process path real traffic uses.
      */
-    const proxyUpgrade = (wss: WebSocketServer, req: IncomingMessage, socket: import('node:stream').Duplex, head: Buffer) => {
-      if (!authorized(req)) {
-        // Refuse before protocol negotiation, so an unauthenticated caller
-        // never reaches the handshake.
-        socket.end('HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n')
-        return
-      }
-      wss.handleUpgrade(req, socket, head, (outer) => {
-        const inner = new WebSocket(muxProxyUrl(cfg.proxyTarget))
-        outer.on('message', () => outer.close(1008, 'downlink only'))
-        outer.on('close', () => { try { inner.close() } catch { /* noop */ } })
-        outer.on('error', () => { try { inner.close() } catch { /* noop */ } })
-        inner.onmessage = (event: { data: unknown }) => {
-          if (outer.readyState !== WebSocket.OPEN) return
-          try { outer.send(String(event.data)) } catch { /* socket going away */ }
-        }
-        inner.onclose = () => { try { outer.close() } catch { /* noop */ } }
-        inner.onerror = () => { try { outer.close() } catch { /* noop */ } }
-      })
-    }
-
-    /** Upstream liveness for /health: one cheap, bounded host.describe probe. */
     const healthUpstream = async (): Promise<'ok' | 'unreachable'> => {
       try {
-        const res = await fetch(unaryProxyUrl(cfg.proxyTarget, 'host.describe'), {
+        const connection = hostService<HostConnection>('connection')
+        if (connection === undefined) return 'unreachable'
+        const handler = connection.createSharedFetchHandler('/api')
+        const res = await handler.fetch(new Request(dispatchUrl('session/list'), {
           method: 'POST',
           headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({ type: 'client-request', rpcId: 'apigw-health', method: 'host.describe', payload: {} }),
+          body: JSON.stringify({
+            type: 'client-request',
+            rpcId: 'apigw-health',
+            method: 'session/list',
+            payload: { args: { _request: {} } },
+          }),
           signal: AbortSignal.timeout(5_000),
-        })
+        }))
         if (!res.ok) return 'unreachable'
-        const json = await res.json() as { type?: string }
-        return json.type === 'server-response' ? 'ok' : 'unreachable'
+        const json = await res.json() as { type?: string; result?: { ok?: boolean } }
+        return json.type === 'server-response' && json.result?.ok === true ? 'ok' : 'unreachable'
       } catch {
         return 'unreachable'
       }
@@ -334,10 +346,10 @@ export default {
             { method: 'POST', path: cfg.prefix + '/key', auth: 'first call only' },
             { method: 'POST', path: cfg.prefix + '/admin/enable', auth: 'admin' },
             { method: 'POST', path: cfg.prefix + '/admin/rotate-key', auth: 'admin' },
-            { method: 'POST', path: cfg.prefix + '/proxy/<method>', auth: true, note: 'apiproxy unary passthrough (whitelisted)' },
-            { method: 'POST', path: cfg.prefix + '/proxy/respond', auth: true, note: 'answer questions / approvals' },
+            { method: 'POST', path: cfg.prefix + '/proxy/<namespace>/<method>', auth: true, note: 'in-process Remote dispatch (whitelisted)' },
             { method: 'POST', path: cfg.prefix + '/sessions/{id}/sandbox-mode', auth: true, note: 'per-session sandbox override (read-only | workspace-write)' },
-            { method: 'GET', path: cfg.prefix + '/events.mux', auth: true, note: 'WebSocket, downlink only' },
+            { method: 'GET', path: cfg.prefix + '/events.mux', auth: true, note: 'WebSocket mux: open/cancel streams, item/error/end frames' },
+            { method: 'GET', path: cfg.prefix + '/proxy/events.mux', auth: true, note: 'alias of events.mux' },
           ],
         })
       }
@@ -348,10 +360,8 @@ export default {
        * Unauthenticated *only* while the deployment has no key from any source --
        * the single moment when there is no credential that could be demanded. The
        * minted key is persisted before it is returned, so provisionDecision
-       * refuses every later call, including after a restart. A caller that
-       * already holds a key is refused too: it has nothing to learn here, and
-       * echoing a stored secret back over an authenticated request is a way to
-       * leak the *other* keys a deployment has.
+       * refuses every later call, including after a restart, and a
+       * minted-but-unpersisted (volatile) key closes the window too.
        */
       if (seg.length === 1 && seg[0] === 'key' && req.method === 'POST') {
         const decision = provisionDecision({
@@ -359,6 +369,7 @@ export default {
           apiKeys: cfg.apiKeys,
           allowKeyProvision: cfg.allowKeyProvision,
           prefix: cfg.prefix,
+          volatileKey: volatileKey !== null,
         })
         if (decision.action === 'refuse') {
           return sendJson(res, decision.status, { error: decision.error, hint: decision.hint })
@@ -404,7 +415,8 @@ export default {
       }
       // Replaces the provisioned key only. apiKeys is the operator's own list
       // and rotating over it would silently revoke keys the gateway was never
-      // asked to manage.
+      // asked to manage. Without a settings provider the previous provisioned
+      // key is cleared from the live config as well, so rotation really revokes.
       if (seg.length === 2 && seg[0] === 'admin' && seg[1] === 'rotate-key' && req.method === 'POST') {
         if (!isAdmin(req)) return sendJson(res, 401, { error: 'admin_unauthorized' })
         const minted = randomToken('apigw-', 32)
@@ -417,6 +429,7 @@ export default {
           cfg = { ...cfg, provisionedKey: minted }
         } else {
           volatileKey = minted
+          cfg = { ...cfg, provisionedKey: undefined }
         }
         ctx.logger?.info?.('[dsh-api-gw] API key rotated')
         return sendJson(res, 200, { apiKey: minted, persisted: settingsScope !== null })
@@ -424,19 +437,19 @@ export default {
 
       // The proxy surface: auth first, then whitelist (fail closed), then bytes.
       // Auth before whitelist so an unauthenticated caller cannot probe which
-      // methods exist by telling 403 from 401 apart.
-      if (seg.length === 2 && seg[0] === 'proxy' && req.method === 'POST') {
+      // endpoints exist by telling 403 from 401 apart.
+      if (seg.length === 3 && seg[0] === 'proxy' && req.method === 'POST') {
         if (!requireAuth(req, res)) return
-        const method = seg[1]
-        if (!isProxyMethodAllowed(method, cfg.proxyWhitelist)) {
-          return sendJson(res, 403, { error: 'method_not_allowed', hint: 'The requested apiproxy method is not on the proxy whitelist.' })
+        const endpoint = endpointOf(seg[1], seg[2])
+        if (!isProxyEndpointAllowed(endpoint, cfg.proxyWhitelist)) {
+          return sendJson(res, 403, { error: 'method_not_allowed', hint: 'The requested endpoint is not on the proxy whitelist.' })
         }
         try {
-          await proxyUnary(req, res, method)
+          await proxyUnary(req, res, endpoint)
         } catch (error) {
-          ctx.logger?.warn?.('[dsh-api-gw] proxy ' + method + ' failed: ' + String(error))
+          ctx.logger?.warn?.('[dsh-api-gw] proxy ' + endpoint + ' failed: ' + String(error))
           if (res.headersSent) { try { res.destroy() } catch { /* noop */ } ; return }
-          return sendJson(res, 502, { error: 'upstream_unreachable', detail: errorDetail(error) })
+          return sendJson(res, 502, { error: 'host_unavailable', detail: errorDetail(error) })
         }
         return
       }
@@ -444,8 +457,7 @@ export default {
       /**
        * Per-session sandbox-mode override.
        *
-       * The wire contract has no sandbox field: session.create takes
-       * { cwd | workspaceId, sessionId?, agentPreset? }, and no RPC switches a
+       * The wire contract has no sandbox field and no Remote method switches a
        * session's mode. The host keeps the override as `sandbox/mode` log
        * events (dsh-sandbox-policy/session-mode), and its write path is
        * process-internal — so this small route is the only way a remote client
@@ -471,8 +483,8 @@ export default {
           })
         }
         // Soft dependency: a host without the session store degrades cleanly
-        // instead of breaking plugin startup (RULE 2).
-        const sessions = ctx.get('sessions', true) as SessionStore | undefined
+        // instead of breaking plugin startup.
+        const sessions = hostService<SessionStore>('sessions')
         if (sessions === undefined) {
           return sendJson(res, 501, { error: 'service_unavailable', hint: 'host session store is not available' })
         }
@@ -492,10 +504,28 @@ export default {
 
     // ---- mount ----
 
-    // One noServer acceptor for all mux upgrades; handleUpgrade is called
-    // per connection so the auth check runs before protocol negotiation.
+    // One noServer acceptor for all mux upgrades; handleUpgrade is called per
+    // connection so the auth check runs before protocol negotiation.
     const wss = new WebSocketServer({ noServer: true })
     wss.on('error', () => { /* an aborted upgrade must not crash the host */ })
+    const muxSessions = new Set<MuxSession>()
+
+    const proxyUpgrade = (req: IncomingMessage, socket: import('node:stream').Duplex, head: Buffer) => {
+      if (!authorized(req)) {
+        // Refuse before protocol negotiation, so an unauthenticated caller
+        // never reaches the handshake.
+        socket.end('HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n')
+        return
+      }
+      wss.handleUpgrade(req, socket, head, (ws: WebSocket) => {
+        const session = new MuxSession(ws, {
+          gateway: () => hostService<HostTypertGateway>('typertGateway'),
+          whitelist: () => cfg.muxWhitelist,
+        })
+        muxSessions.add(session)
+        ws.on('close', () => { muxSessions.delete(session) })
+      })
+    }
 
     let disposeRoute: (() => void) | null = null
     const disposeUpgrades: Array<() => void> = []
@@ -506,7 +536,7 @@ export default {
         kind: 'prefix',
         path: cfg.prefix,
         // The promise is returned so the carrier (and tests) can await the
-        // full response lifecycle; SSE-style long responses were removed in S3.
+        // full response lifecycle.
         handler: (req, res) => Promise.resolve(dispatch(req, res)).catch((error) => {
           ctx.logger?.warn?.('[dsh-api-gw] request failed: ' + String(error))
           try {
@@ -516,14 +546,13 @@ export default {
         }),
       }
       disposeRoute = webServer.register(route)
-      // Two upgrade paths: the canonical one (matching the plan's surface)
-      // and one under /proxy so a client whose base is the proxy prefix
-      // (the manager's uniform base + method assumption) derives the mux
-      // URL without any special case.
+      // Two upgrade paths: the canonical one and one under /proxy so a client
+      // whose base is the proxy prefix (the manager's uniform base + method
+      // assumption) derives the mux URL without any special case.
       for (const path of [cfg.prefix + '/events.mux', cfg.prefix + '/proxy/events.mux']) {
         const upgrade: WebUpgradeRoute = {
           path,
-          handler: (req, socket, head) => proxyUpgrade(wss, req, socket, head),
+          handler: (req, socket, head) => proxyUpgrade(req, socket, head),
         }
         disposeUpgrades.push(webServer.registerUpgrade(upgrade))
       }
@@ -536,6 +565,8 @@ export default {
         while (disposeUpgrades.length > 0) { try { disposeUpgrades.pop()!() } catch { /* noop */ } }
         // Terminated rather than closed politely: an unload must not wait on
         // clients that keep their sockets open.
+        for (const session of muxSessions) { try { session.close() } catch { /* noop */ } }
+        muxSessions.clear()
         for (const client of wss.clients) client.terminate()
         wss.close()
       }
@@ -546,13 +577,10 @@ export default {
     // apiKeys) are declared role('secret') in the schema, so the wire surface
     // redacts them. Non-fatal by design: a deployment without a settings
     // provider simply keeps the composition-row config.
-    //
-    // The namespace is 'dsh-api-gw': DSH ships a built-in
-    // @deepseek-ai/dsh-api-gateway (the typert Remote dispatcher), so a card
-    // keyed 'api-gateway' would be indistinguishable from it in the plugin list.
     ctx.inject(['settings'], (sctx) => {
       try {
-        const scope = sctx.settings.register(settingsNamespace('dsh-api-gw'), Config, { base: config, applies: 'live' })
+        const settings = (sctx as unknown as { settings: HostSettings }).settings
+        const scope = settings.register<Config>(SETTINGS_NAMESPACE, Config, { base: config, applies: 'live' })
         settingsScope = scope
         const resolved = scope.get()
         const prefixChanged = resolved.prefix !== cfg.prefix
@@ -568,7 +596,6 @@ export default {
       }
     })
 
-    ctx.logger?.info?.('[dsh-api-gw] mounted at ' + cfg.prefix + ' proxying ' + cfg.proxyTarget + ' (enabled=' + String(cfg.enabled) + ')')
+    ctx.logger?.info?.('[dsh-api-gw] mounted at ' + cfg.prefix + ' (in-process dispatch, enabled=' + String(cfg.enabled) + ')')
   },
 }
-

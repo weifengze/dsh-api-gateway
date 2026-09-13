@@ -24,12 +24,6 @@ export declare const resolveCorsOrigin: (configured: string | string[], requestO
  */
 export declare const routeSegments: (prefix: string, url: string | undefined) => string[] | null;
 /**
- * Decode a request body honouring the Content-Type charset (RFC 9110):
- * default UTF-8, but accept e.g. gbk/gb2312 from clients that still send
- * ANSI-encoded bodies (notably Windows PowerShell 5.1).
- */
-export declare const decodeBody: (buf: Uint8Array, contentType: string | undefined) => string;
-/**
  * Whether `POST {prefix}/key` may still mint a key.
  *
  * The bootstrap is meant to be available only while the deployment has no key at
@@ -54,10 +48,6 @@ export declare const provisionDecision: (input: {
     apiKeys: readonly string[];
     allowKeyProvision: boolean;
     prefix: string;
+    /** True while a minted-but-unpersisted key is live (no settings provider). */
+    volatileKey?: boolean;
 }) => ProvisionDecision;
-/** Project a persisted session header down to the wire shape. */
-export declare const mapHeader: (header: unknown) => {
-    id: string | null;
-    title: string | null;
-    cwd: string | null;
-};

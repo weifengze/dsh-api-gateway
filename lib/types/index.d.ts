@@ -1,18 +1,29 @@
 /**
- * dsh-api-gateway — Host half (S3: authenticated loopback proxy).
+ * dsh-api-gateway — Host half (0.3: in-process Remote gateway for DSH 0.1.5).
  *
- * The plugin no longer drives agents. It is a thin, fail-closed reverse proxy
- * that lets an external client (the manager) reach the harness's own /api
- * surface (dsh-client-connection + dsh-host-apiproxy) from another machine:
+ * The plugin publishes an authenticated, fail-closed HTTP/WebSocket surface to
+ * remote clients (typically dsh-agent-manager) and dispatches every request
+ * INSIDE the host process:
  *
- *   POST {prefix}/proxy/<method>  ->  POST <proxyTarget>/<method>   (unary passthrough)
- *   POST {prefix}/proxy/respond   ->  POST <proxyTarget>/respond    (answers)
- *   GET  {prefix}/events.mux      ->  WS <proxyTarget>/events.mux   (downlink-only pipe)
+ *   POST {prefix}/proxy/<namespace>/<method>  -> host shared /api fetch handler
+ *   GET  {prefix}/events.mux                  -> WS mux: open/cancel streams,
+ *                                                item/error/end frames
+ *   POST {prefix}/sessions/{id}/sandbox-mode  -> in-process sandbox override
  *
- * Every proxied path requires an API key, and every method must be on the
- * whitelist — anything else is refused before touching the upstream. The
- * proxy never parses the RPC envelope: it forwards bytes, so the wire
- * contract belongs to DSH and the manager, not to this plugin.
+ * Why in-process dispatch: DSH 0.1.5 gates its `/api` route with Host/Origin
+ * checks AND a browser-session cookie (`browserAuth`), so a loopback HTTP fetch
+ * is not a viable upstream — even from the host's own process. The host
+ * connection service exposes `createSharedFetchHandler('/api')`, whose Fetch
+ * handler composes exact routes plus the Typert interceptor WITHOUT the HTTP
+ * route's auth fence; that is the supported in-process entry. Streams go
+ * through `ctx.typertGateway.wireStream.open(endpoint, payload, signal)`,
+ * including the Gateway-owned `$events` stream that carries forwarded
+ * approvals and user questions.
+ *
+ * Every proxied unary endpoint must be on the whitelist and every mux stream
+ * endpoint must be on the mux whitelist — anything else is refused before the
+ * host is touched. The proxy never parses the RPC envelope's contents: it
+ * forwards bytes and lets the host validate `args` against its descriptors.
  *
  * Install: pnpm add dsh-api-gateway, then add one row to the host composition
  * (see README / examples/cordis.yml). Uninstall: remove the row and restart.
@@ -46,10 +57,10 @@ export interface Config {
     corsOrigin: string | string[];
     /** Include internal error messages in HTTP responses (helpful locally, noisy publicly). */
     exposeErrors: boolean;
-    /** Upstream /api base to forward to. Defaults to the loopback DSH /api. */
-    proxyTarget: string;
-    /** Optional override for the proxy whitelist; defaults to DEFAULT_PROXY_WHITELIST. */
+    /** Unary endpoint whitelist; defaults to DEFAULT_PROXY_WHITELIST. */
     proxyWhitelist: string[];
+    /** Mux stream endpoint whitelist; defaults to DEFAULT_MUX_WHITELIST. */
+    muxWhitelist: string[];
 }
 export declare const Config: z<Schemastery.ObjectS<{
     prefix: z<string, string>;
@@ -60,8 +71,8 @@ export declare const Config: z<Schemastery.ObjectS<{
     adminKey: z<string, string>;
     corsOrigin: z<string | string[], string | string[]>;
     exposeErrors: z<boolean, boolean>;
-    proxyTarget: z<string, string>;
     proxyWhitelist: z<string[], string[]>;
+    muxWhitelist: z<string[], string[]>;
 }>, Schemastery.ObjectT<{
     prefix: z<string, string>;
     enabled: z<boolean, boolean>;
@@ -71,8 +82,8 @@ export declare const Config: z<Schemastery.ObjectS<{
     adminKey: z<string, string>;
     corsOrigin: z<string | string[], string | string[]>;
     exposeErrors: z<boolean, boolean>;
-    proxyTarget: z<string, string>;
     proxyWhitelist: z<string[], string[]>;
+    muxWhitelist: z<string[], string[]>;
 }>>;
 declare const _default: {
     inject: string[];
@@ -85,8 +96,8 @@ declare const _default: {
         adminKey: z<string, string>;
         corsOrigin: z<string | string[], string | string[]>;
         exposeErrors: z<boolean, boolean>;
-        proxyTarget: z<string, string>;
         proxyWhitelist: z<string[], string[]>;
+        muxWhitelist: z<string[], string[]>;
     }>, Schemastery.ObjectT<{
         prefix: z<string, string>;
         enabled: z<boolean, boolean>;
@@ -96,8 +107,8 @@ declare const _default: {
         adminKey: z<string, string>;
         corsOrigin: z<string | string[], string | string[]>;
         exposeErrors: z<boolean, boolean>;
-        proxyTarget: z<string, string>;
         proxyWhitelist: z<string[], string[]>;
+        muxWhitelist: z<string[], string[]>;
     }>>;
     apply(ctx: Context, config: Config): void;
 };

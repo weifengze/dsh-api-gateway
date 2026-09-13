@@ -1,18 +1,20 @@
 openapi: 3.0.3
 info:
-  title: dsh-api-gateway (loopback proxy)
-  version: 0.2.0
+  title: dsh-api-gateway
+  version: 0.3.0
   description: >
-    Authenticated, fail-closed loopback proxy over the DeepSeek Harness /api
-    (apiproxy) surface. Unary calls and respond pass through verbatim; the mux
-    is a downlink-only WebSocket pipe. Wire envelopes belong to apiproxy, not
-    to this proxy: the proxy only checks the method name on the path.
+    Authenticated, fail-closed gateway over the DeepSeek Harness (0.1.5-rc.2)
+    in-process Remote API. Unary calls and the answer channel are forwarded
+    byte-for-byte into the host's shared /api Fetch handler; streams run over a
+    multiplexed WebSocket mux. Wire envelopes belong to the host, not to this
+    gateway: it only checks the endpoint name against a whitelist and never
+    parses the RPC body.
 servers:
   - url: http://127.0.0.1:3080/api-gw/v1
 paths:
   /health:
     get:
-      summary: Plugin status and upstream liveness
+      summary: Plugin status and host dispatch reachability
       security: []
       responses:
         '200':
@@ -61,31 +63,49 @@ paths:
                 properties:
                   apiKey: { type: string }
                   persisted: { type: boolean }
-  /proxy/{method}:
+  /proxy/{namespace}/{method}:
     post:
-      summary: Unary apiproxy passthrough (whitelisted methods only)
+      summary: Unary Remote dispatch through the host shared /api handler
+      description: >
+        Body and response are the host envelopes verbatim:
+
+        request `{ "type": "client-request", "rpcId": "...",
+        "method": "<namespace>/<method>", "payload": { "args": { ... } } }`;
+
+        response `{ "type": "server-response", "rpcId": "...",
+        "result": { "ok": true, "value": ... } }` or
+        `{ "type": "server-response", "rpcId": "...",
+        "result": { "ok": false, "error": { "code", "message", "details" } } }`.
+
+        Argument names come from the host descriptor (`request`, `_request`,
+        or none). The gateway only enforces the whitelist.
       parameters:
+        - name: namespace
+          in: path
+          required: true
+          schema: { type: string }
         - name: method
           in: path
           required: true
           schema: { type: string }
           description: >
-            One of: session.list, session.create, session.history, session.prompt,
-            session.cancel, session.rename, session.fork, session.updateQueue,
-            session.attachment, session.models, session.selectModel, respond,
-            host.describe
+            Whitelisted endpoints: session/list, session/create, session/page,
+            session/prompt, session/cancel, session/rename, session/fork,
+            session/updateQueue, session/attachment, session/modelCatalog,
+            session/selectModel, $events/result.
       security:
         - ApiKey: []
+        - BearerKey: []
       requestBody:
         required: true
         content:
           application/json:
             schema: { type: object }
       responses:
-        '200': { description: apiproxy server-response, verbatim }
+        '200': { description: host server-response envelope, verbatim }
         '401': { description: unauthorized }
         '403': { description: method_not_allowed (whitelist) }
-        '502': { description: upstream_unreachable }
+        '502': { description: host_unavailable (connection service missing) }
   /sessions/{id}/sandbox-mode:
     post:
       summary: >
@@ -100,6 +120,7 @@ paths:
           description: Session id (must be live/attached)
       security:
         - ApiKey: []
+        - BearerKey: []
       requestBody:
         required: true
         content:
@@ -126,15 +147,28 @@ paths:
   /events.mux:
     get:
       summary: >
-        Mux WebSocket downlink (X-API-Key in the upgrade headers). Downlink
-        only: any client frame closes the socket with 1008.
+        Remote stream mux (WebSocket upgrade; X-API-Key in the upgrade
+        headers). One socket multiplexes logical streams.
       description: >
-        Also registered at /proxy/events.mux so clients whose base is the
-        proxy prefix derive the mux URL uniformly.
+        Client frames: `{ "type": "open", "streamId", "endpoint", "payload" }`
+        and `{ "type": "cancel", "streamId" }`.
+        Host frames: `{ "type": "item", "streamId", "value" }`,
+        `{ "type": "error", "streamId", "error" }`,
+        `{ "type": "end", "streamId" }`.
+
+        Whitelisted stream endpoints: `$events` (forwarded approvals and user
+        questions; payload `{ "args": {} }`), `session/follow`,
+        `session/control`. Answers to `$events` waterfall frames go through
+        `POST /proxy/$events/result`.
+
+        The server pings every 2 seconds and terminates the socket after two
+        missed pongs. Also registered at `/proxy/events.mux` so clients whose
+        base is the proxy prefix derive the mux URL uniformly.
       security:
         - ApiKey: []
+        - BearerKey: []
       responses:
-        '101': { description: Switching Protocols; server-request frames follow }
+        '101': { description: Switching Protocols; item/error/end frames follow }
         '401': { description: upgrade refused before protocol negotiation }
 components:
   securitySchemes:

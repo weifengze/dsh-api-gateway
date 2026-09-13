@@ -1,10 +1,10 @@
 /**
- * Unit tests for the HTTP plumbing (CORS negotiation, route splitting, body
- * decoding). Runs against the BUILT output (`lib/`).
+ * Unit tests for the HTTP plumbing (CORS negotiation, route splitting,
+ * one-time key provisioning). Runs against the BUILT output (`lib/`).
  */
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { decodeBody, mapHeader, provisionDecision, resolveCorsOrigin, routeSegments } from '../lib/http.js'
+import { provisionDecision, resolveCorsOrigin, routeSegments } from '../lib/http.js'
 
 const provision = (over = {}) => provisionDecision({
   provisionedKey: undefined,
@@ -48,6 +48,17 @@ test('provisionDecision reports a disabled bootstrap distinctly from a used one'
   assert.equal(decision.error, 'key_provisioning_disabled')
 })
 
+test('provisionDecision stays closed while a minted key lives only in memory', () => {
+  // Regression: a deployment without a settings provider kept the minted key
+  // in a volatile slot, and the predicate ignored it — so the unauthenticated
+  // /key window stayed open (and an admin rotation could be overwritten by an
+  // anonymous mint). The volatile flag must close it.
+  const decision = provision({ volatileKey: true })
+  assert.equal(decision.action, 'refuse')
+  assert.equal(decision.error, 'key_already_provisioned')
+  assert.match(decision.hint, /rotate-key/)
+})
+
 test('resolveCorsOrigin passes wildcard through without Vary', () => {
   assert.deepEqual(resolveCorsOrigin('*', 'https://a.example'), { origin: '*', vary: false })
   assert.deepEqual(resolveCorsOrigin(['*', 'https://a.example'], undefined), { origin: '*', vary: false })
@@ -86,27 +97,9 @@ test('routeSegments rejects URLs outside the prefix', () => {
   assert.equal(routeSegments('/api-gw/v1', undefined), null)
 })
 
-test('decodeBody defaults to UTF-8', () => {
-  const buf = Buffer.from('{"content":"你好"}', 'utf8')
-  assert.equal(decodeBody(buf, 'application/json'), '{"content":"你好"}')
-  assert.equal(decodeBody(buf, 'application/json; charset=UTF-8'), '{"content":"你好"}')
-  assert.equal(decodeBody(buf, undefined), '{"content":"你好"}')
-})
-
-test('decodeBody honours a declared legacy charset (PowerShell 5.1 sends GBK)', () => {
-  // GBK bytes for 你好 — must not be read as UTF-8.
-  const gbk = Buffer.from([0x7b, 0x22, 0x63, 0x22, 0x3a, 0x22, 0xc4, 0xe3, 0xba, 0xc3, 0x22, 0x7d])
-  assert.equal(decodeBody(gbk, 'application/json; charset=gbk'), '{"c":"你好"}')
-})
-
-test('decodeBody falls back to UTF-8 for an unknown charset', () => {
-  const buf = Buffer.from('{"a":1}', 'utf8')
-  assert.equal(decodeBody(buf, 'application/json; charset=not-a-charset'), '{"a":1}')
-})
-
-test('mapHeader keeps only known string fields', () => {
-  assert.deepEqual(mapHeader({ id: 's1', title: 't', cwd: '/w', secret: 'x' }), { id: 's1', title: 't', cwd: '/w' })
-  assert.deepEqual(mapHeader({ id: 1, title: null }), { id: null, title: null, cwd: null })
-  assert.deepEqual(mapHeader(null), { id: null, title: null, cwd: null })
-  assert.deepEqual(mapHeader(undefined), { id: null, title: null, cwd: null })
+test('routeSegments keeps the slash-form endpoint as two segments', () => {
+  // DSH 0.1.5 endpoints are `<namespace>/<method>`; the proxy route carries
+  // them as two path segments after /proxy.
+  assert.deepEqual(routeSegments('/api-gw/v1', '/api-gw/v1/proxy/session/create'), ['proxy', 'session', 'create'])
+  assert.deepEqual(routeSegments('/api-gw/v1', '/api-gw/v1/proxy/$events/result'), ['proxy', '$events', 'result'])
 })
